@@ -1,174 +1,156 @@
 const express = require('express');
 const dns = require('dns').promises;
-const cors = require('cors');
 
 const app = express();
-app.use(cors());
+
+/* ─────────────────────────────────────────────
+   CORS (Cloudflare Pages → Render)
+───────────────────────────────────────────── */
+const allowedOrigins = [
+  'https://umarsofiyaan.shop',
+  'https://email-dns-frontend.pages.dev'
+];
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
+
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
+  next();
+});
+
 app.use(express.json());
 
-// ═══════════════════════════════════════════════════════════════
-// HELPER: Extract SPF record from TXT records
-// ═══════════════════════════════════════════════════════════════
+/* ─────────────────────────────────────────────
+   SPF HELPERS
+───────────────────────────────────────────── */
 function extractSPFRecord(txtRecords) {
-  const spfRecords = txtRecords.filter(record => {
-    const joined = Array.isArray(record) ? record.join('') : record;
-    return joined.startsWith('v=spf1');
-  });
-  
+  const spfRecords = txtRecords
+    .map(r => Array.isArray(r) ? r.join('') : r)
+    .filter(r => r.startsWith('v=spf1'));
+
   if (spfRecords.length === 0) return null;
-  
+
   return {
-    record: Array.isArray(spfRecords[0]) ? spfRecords[0].join('') : spfRecords[0],
+    record: spfRecords[0],
     multiple: spfRecords.length > 1
   };
 }
 
-// ═══════════════════════════════════════════════════════════════
-// HELPER: Count DNS lookups in SPF record
-// ═══════════════════════════════════════════════════════════════
 function countSPFLookups(spfRecord) {
-  // Mechanisms that trigger DNS lookups: include, a, mx, ptr, exists
-  const lookupMechanisms = ['include:', 'a:', 'mx:', 'ptr:', 'exists:'];
+  const mechanisms = ['include:', 'a', 'mx', 'ptr', 'exists:'];
   let count = 0;
-  
-  lookupMechanisms.forEach(mechanism => {
-    const regex = new RegExp(mechanism, 'g');
+
+  mechanisms.forEach(m => {
+    const regex = new RegExp(`\\b${m}`, 'g');
     const matches = spfRecord.match(regex);
     if (matches) count += matches.length;
   });
-  
-  // Standalone 'a' and 'mx' without colon also count
-  if (/\ba\b/.test(spfRecord)) count++;
-  if (/\bmx\b/.test(spfRecord)) count++;
-  
+
   return count;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// HELPER: Parse SPF policy
-// ═══════════════════════════════════════════════════════════════
 function parseSPFPolicy(spfRecord) {
-  if (spfRecord.includes('~all')) return '~all (SoftFail)';
   if (spfRecord.includes('-all')) return '-all (Fail)';
+  if (spfRecord.includes('~all')) return '~all (SoftFail)';
   if (spfRecord.includes('?all')) return '?all (Neutral)';
   if (spfRecord.includes('+all')) return '+all (Pass)';
   return 'Unknown';
 }
 
-// ═══════════════════════════════════════════════════════════════
-// HELPER: Detect email provider from MX records
-// ═══════════════════════════════════════════════════════════════
+/* ─────────────────────────────────────────────
+   MX HELPERS
+───────────────────────────────────────────── */
 function detectEmailProvider(mxRecords) {
   const exchanges = mxRecords.map(mx => mx.exchange.toLowerCase());
-  
-  if (exchanges.some(e => e.includes('google.com') || e.includes('googlemail.com'))) {
-    return 'Google Workspace';
-  }
-  if (exchanges.some(e => e.includes('outlook.com') || e.includes('protection.outlook.com'))) {
-    return 'Microsoft 365';
-  }
-  if (exchanges.some(e => e.includes('zoho.com'))) {
-    return 'Zoho Mail';
-  }
-  if (exchanges.some(e => e.includes('protonmail.ch'))) {
-    return 'ProtonMail';
-  }
-  
-  return 'Unknown/Custom';
+
+  if (exchanges.some(e => e.includes('google.com'))) return 'Google Workspace';
+  if (exchanges.some(e => e.includes('outlook.com') || e.includes('protection.outlook.com'))) return 'Microsoft 365';
+  if (exchanges.some(e => e.includes('zoho.com'))) return 'Zoho Mail';
+  if (exchanges.some(e => e.includes('protonmail'))) return 'Proton Mail';
+
+  return 'Unknown / Custom';
 }
 
-// ═══════════════════════════════════════════════════════════════
-// HELPER: Check for multiple email providers
-// ═══════════════════════════════════════════════════════════════
 function detectMultipleProviders(mxRecords) {
   const providers = new Set();
-  
+
   mxRecords.forEach(mx => {
-    const exchange = mx.exchange.toLowerCase();
-    if (exchange.includes('google.com')) providers.add('Google');
-    if (exchange.includes('outlook.com')) providers.add('Microsoft');
-    if (exchange.includes('zoho.com')) providers.add('Zoho');
+    const e = mx.exchange.toLowerCase();
+    if (e.includes('google.com')) providers.add('Google');
+    if (e.includes('outlook.com')) providers.add('Microsoft');
+    if (e.includes('zoho.com')) providers.add('Zoho');
   });
-  
+
   return providers.size > 1;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// HELPER: Estimate DKIM key size
-// ═══════════════════════════════════════════════════════════════
-function estimateDKIMKeySize(dkimRecord) {
-  const keyMatch = dkimRecord.match(/p=([A-Za-z0-9+/=]+)/);
-  if (!keyMatch) return 'Unknown';
-  
-  const keyData = keyMatch[1];
-  const estimatedBits = (keyData.length * 6) / 8 * 8; // Base64 to bits approximation
-  
-  if (estimatedBits >= 2000) return '2048-bit';
-  if (estimatedBits >= 1000) return '1024-bit';
-  return `~${Math.round(estimatedBits)}-bit`;
+/* ─────────────────────────────────────────────
+   DKIM HELPERS
+───────────────────────────────────────────── */
+function detectDKIMKeyType(record) {
+  if (record.includes('k=ed25519')) return 'Ed25519';
+  return 'RSA';
 }
 
-// ═══════════════════════════════════════════════════════════════
-// HELPER: Detect DKIM key type
-// ═══════════════════════════════════════════════════════════════
-function detectDKIMKeyType(dkimRecord) {
-  if (dkimRecord.includes('k=ed25519')) return 'Ed25519';
-  if (dkimRecord.includes('k=rsa') || !dkimRecord.includes('k=')) return 'RSA';
-  return 'Unknown';
+function estimateDKIMKeySize(record) {
+  const match = record.match(/p=([A-Za-z0-9+/=]+)/);
+  if (!match) return 'Unknown';
+
+  // Rough Base64 length → key size estimate
+  const bits = Math.round((match[1].length * 6) / 8) * 8;
+
+  if (bits >= 2048) return '2048-bit';
+  if (bits >= 1024) return '1024-bit';
+  return `${bits}-bit`;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION: MX Records
-// ═══════════════════════════════════════════════════════════════
+/* ─────────────────────────────────────────────
+   CHECKS
+───────────────────────────────────────────── */
 async function checkMX(domain) {
   try {
-    const mxRecords = await dns.resolveMx(domain);
-    
-    if (mxRecords.length === 0) {
-      return {
-        status: 'FAIL',
-        records: [],
-        provider: 'None',
-        issues: ['No MX records found']
-      };
-    }
-    
-    const provider = detectEmailProvider(mxRecords);
-    const multipleProviders = detectMultipleProviders(mxRecords);
+    const records = await dns.resolveMx(domain);
+    records.sort((a, b) => a.priority - b.priority);
+
+    const provider = detectEmailProvider(records);
     const issues = [];
-    
-    if (multipleProviders) {
-      issues.push('Multiple email providers detected - this may cause delivery issues');
+
+    if (detectMultipleProviders(records)) {
+      issues.push('Multiple email providers detected');
     }
-    
-    // Sort by priority
-    mxRecords.sort((a, b) => a.priority - b.priority);
-    
+
     return {
-      status: issues.length > 0 ? 'WARN' : 'PASS',
-      records: mxRecords,
+      status: issues.length ? 'WARN' : 'PASS',
+      records,
       provider,
       issues
     };
-  } catch (error) {
+  } catch (e) {
     return {
       status: 'FAIL',
       records: [],
       provider: 'None',
-      issues: [`DNS lookup failed: ${error.message}`]
+      issues: [e.message]
     };
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION: SPF Records
-// ═══════════════════════════════════════════════════════════════
 async function checkSPF(domain) {
   try {
-    const txtRecords = await dns.resolveTxt(domain);
-    const spfData = extractSPFRecord(txtRecords);
-    
-    if (!spfData) {
+    const txt = await dns.resolveTxt(domain);
+    const spf = extractSPFRecord(txt);
+
+    if (!spf) {
       return {
         status: 'FAIL',
         record: null,
@@ -177,262 +159,137 @@ async function checkSPF(domain) {
         issues: ['No SPF record found']
       };
     }
-    
+
     const issues = [];
-    
-    if (spfData.multiple) {
-      issues.push('Multiple SPF records detected - only the first one will be used');
+    const lookupCount = countSPFLookups(spf.record);
+    const policy = parseSPFPolicy(spf.record);
+
+    if (spf.multiple) issues.push('Multiple SPF records detected');
+    if (lookupCount > 10) issues.push(`SPF lookup count (${lookupCount}) exceeds 10`);
+    if (policy.includes('Neutral') || policy.includes('Pass')) {
+      issues.push('SPF policy is too permissive');
     }
-    
-    const lookupCount = countSPFLookups(spfData.record);
-    if (lookupCount > 10) {
-      issues.push(`SPF lookup count (${lookupCount}) exceeds the limit of 10 - this will cause SPF failures`);
-    }
-    
-    const policy = parseSPFPolicy(spfData.record);
-    
-    if (policy === '?all (Neutral)' || policy === '+all (Pass)') {
-      issues.push(`Policy ${policy} is too permissive and may allow spoofing`);
-    }
-    
+
     return {
-      status: issues.length > 0 ? 'WARN' : 'PASS',
-      record: spfData.record,
+      status: issues.length ? 'WARN' : 'PASS',
+      record: spf.record,
       policy,
       lookupCount,
       issues
     };
-  } catch (error) {
+  } catch (e) {
     return {
       status: 'FAIL',
       record: null,
       policy: null,
       lookupCount: 0,
-      issues: [`DNS lookup failed: ${error.message}`]
+      issues: [e.message]
     };
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION: DKIM Auto-Discovery
-// ═══════════════════════════════════════════════════════════════
 async function checkDKIM(domain) {
-  const commonSelectors = [
-    'google',
-    'selector1',
-    'selector2',
-    'default',
-    'dkim',
-    's1',
-    's2',
-    'k1'
-  ];
-  
-  const foundSelectors = [];
-  
-  for (const selector of commonSelectors) {
+  const selectors = ['google', 'selector1', 'selector2', 'default', 'dkim', 's1', 's2'];
+  const found = [];
+
+  for (const s of selectors) {
     try {
-      const dkimDomain = `${selector}._domainkey.${domain}`;
-      const txtRecords = await dns.resolveTxt(dkimDomain);
-      
-      if (txtRecords.length > 0) {
-        const record = Array.isArray(txtRecords[0]) ? txtRecords[0].join('') : txtRecords[0];
-        
-        // Check if it's actually a DKIM record
-        if (record.includes('p=') || record.includes('k=')) {
-          const keyType = detectDKIMKeyType(record);
-          const keySize = estimateDKIMKeySize(record);
-          
-          let provider = 'Unknown';
-          if (selector.startsWith('google')) provider = 'Google Workspace';
-          if (selector.startsWith('selector')) provider = 'Microsoft 365';
-          
-          foundSelectors.push({
-            selector,
-            keyType,
-            keySize,
-            provider,
-            record: record.substring(0, 100) + '...' // Truncate for display
-          });
-        }
+      const recs = await dns.resolveTxt(`${s}._domainkey.${domain}`);
+      const record = recs[0].join('');
+
+      if (record.includes('p=')) {
+        found.push({
+          selector: s,
+          keyType: detectDKIMKeyType(record),
+          keySize: estimateDKIMKeySize(record)
+        });
       }
-    } catch (error) {
-      // Selector doesn't exist, continue
-    }
+    } catch {}
   }
-  
-  if (foundSelectors.length === 0) {
-    return {
-      status: 'WARN',
-      selectors: [],
-      issues: ['No DKIM records found on common selectors. DKIM may be using custom selectors or missing entirely.']
-    };
-  }
-  
-  return {
-    status: 'PASS',
-    selectors: foundSelectors,
-    issues: []
-  };
+
+  return found.length
+    ? { status: 'PASS', selectors: found, issues: [] }
+    : { status: 'WARN', selectors: [], issues: ['No DKIM found on common selectors'] };
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION: DMARC
-// ═══════════════════════════════════════════════════════════════
 async function checkDMARC(domain) {
   try {
-    const dmarcDomain = `_dmarc.${domain}`;
-    const txtRecords = await dns.resolveTxt(dmarcDomain);
-    
-    if (txtRecords.length === 0) {
-      return {
-        status: 'FAIL',
-        record: null,
-        policy: null,
-        issues: ['No DMARC record found']
-      };
-    }
-    
-    const record = Array.isArray(txtRecords[0]) ? txtRecords[0].join('') : txtRecords[0];
-    
-    // Parse DMARC components
-    const policyMatch = record.match(/p=([^;]+)/);
-    const adkimMatch = record.match(/adkim=([^;]+)/);
-    const aspfMatch = record.match(/aspf=([^;]+)/);
-    const ruaMatch = record.match(/rua=([^;]+)/);
-    const rufMatch = record.match(/ruf=([^;]+)/);
-    const pctMatch = record.match(/pct=([^;]+)/);
-    
+    const recs = await dns.resolveTxt(`_dmarc.${domain}`);
+    const record = recs[0].join('');
     const issues = [];
-    const policy = policyMatch ? policyMatch[1] : 'none';
-    
-    if (policy === 'none') {
-      issues.push('DMARC policy is set to "none" - emails will not be protected');
-    }
-    
-    if (!ruaMatch) {
-      issues.push('No aggregate reporting address (rua) configured - you won\'t receive DMARC reports');
-    }
-    
+
+    const policy = record.match(/p=([^;]+)/)?.[1] || 'none';
+    const rua = record.match(/rua=([^;]+)/)?.[1];
+
+    if (policy === 'none') issues.push('DMARC policy is none');
+    if (!rua) issues.push('No DMARC rua configured');
+
     return {
-      status: issues.length > 0 ? 'WARN' : 'PASS',
+      status: issues.length ? 'WARN' : 'PASS',
       record,
-      policy: policy,
-      adkim: adkimMatch ? adkimMatch[1] : 'r (relaxed)',
-      aspf: aspfMatch ? aspfMatch[1] : 'r (relaxed)',
-      rua: ruaMatch ? ruaMatch[1] : null,
-      ruf: rufMatch ? rufMatch[1] : null,
-      pct: pctMatch ? pctMatch[1] : '100',
+      policy,
+      rua,
       issues
     };
-  } catch (error) {
+  } catch (e) {
     return {
       status: 'FAIL',
       record: null,
       policy: null,
-      issues: [`DNS lookup failed: ${error.message}`]
+      issues: ['No DMARC record found']
     };
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SECTION: PTR (Reverse DNS)
-// ═══════════════════════════════════════════════════════════════
 async function checkPTR(ip) {
   if (!ip) {
-    return {
-      status: 'SKIPPED',
-      hostname: null,
-      fcRdns: null,
-      issues: ['No IP address provided']
-    };
+    return { status: 'SKIPPED', issues: ['No IP provided'] };
   }
-  
+
   try {
-    // Perform reverse lookup
     const hostnames = await dns.reverse(ip);
-    
-    if (hostnames.length === 0) {
-      return {
-        status: 'FAIL',
-        hostname: null,
-        fcRdns: false,
-        issues: ['No PTR record found for this IP']
-      };
-    }
-    
     const hostname = hostnames[0];
-    
-    // Perform forward-confirmed reverse DNS (FC-rDNS)
-    try {
-      const addresses = await dns.resolve4(hostname);
-      const fcRdns = addresses.includes(ip);
-      
-      return {
-        status: fcRdns ? 'PASS' : 'FAIL',
-        hostname,
-        fcRdns,
-        issues: fcRdns ? [] : ['Forward-confirmed reverse DNS (FC-rDNS) failed - PTR hostname does not resolve back to the IP']
-      };
-    } catch (error) {
-      return {
-        status: 'FAIL',
-        hostname,
-        fcRdns: false,
-        issues: [`FC-rDNS check failed: ${error.message}`]
-      };
-    }
-  } catch (error) {
+
+    const addresses = await dns.resolve(hostname);
+    const fcRdns = addresses.includes(ip);
+
+    return {
+      status: fcRdns ? 'PASS' : 'FAIL',
+      hostname,
+      fcRdns,
+      issues: fcRdns ? [] : ['FC-rDNS failed']
+    };
+  } catch (e) {
     return {
       status: 'FAIL',
       hostname: null,
       fcRdns: false,
-      issues: [`PTR lookup failed: ${error.message}`]
+      issues: [e.message]
     };
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// MAIN API ENDPOINT
-// ═══════════════════════════════════════════════════════════════
+/* ─────────────────────────────────────────────
+   API
+───────────────────────────────────────────── */
 app.post('/api/check', async (req, res) => {
   const { domain, ip } = req.body;
-  
-  if (!domain) {
-    return res.status(400).json({ error: 'Domain is required' });
-  }
-  
-  // Clean domain input
+  if (!domain) return res.status(400).json({ error: 'Domain is required' });
+
   const cleanDomain = domain.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '');
-  
-  try {
-    // Run all checks in parallel for speed
-    const [mx, spf, dkim, dmarc, ptr] = await Promise.all([
-      checkMX(cleanDomain),
-      checkSPF(cleanDomain),
-      checkDKIM(cleanDomain),
-      checkDMARC(cleanDomain),
-      checkPTR(ip)
-    ]);
-    
-    res.json({
-      domain: cleanDomain,
-      mx,
-      spf,
-      dkim,
-      dmarc,
-      ptr
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: 'Internal server error',
-      message: error.message
-    });
-  }
+
+  const [mx, spf, dkim, dmarc, ptr] = await Promise.all([
+    checkMX(cleanDomain),
+    checkSPF(cleanDomain),
+    checkDKIM(cleanDomain),
+    checkDMARC(cleanDomain),
+    checkPTR(ip)
+  ]);
+
+  res.json({ domain: cleanDomain, mx, spf, dkim, dmarc, ptr });
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
+app.get('/health', (_, res) => {
   res.json({ status: 'OK', service: 'Email DNS Inspector' });
 });
 
