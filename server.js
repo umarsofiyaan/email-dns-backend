@@ -8,7 +8,9 @@ const app = express();
 ───────────────────────────────────────────── */
 const allowedOrigins = [
   'https://email-dns-frontend.pages.dev',
-  'https://dns.umarsofiyaan.shop'
+  'https://dns.umarsofiyaan.shop',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000'
 ];
 
 app.use((req, res, next) => {
@@ -25,7 +27,7 @@ app.use((req, res, next) => {
 app.use(express.json());
 
 /* ─────────────────────────────────────────────
-   MX PROVIDER MAP (EXTENSIBLE)
+   MX PROVIDER MAP
 ───────────────────────────────────────────── */
 const MX_PROVIDERS = [
   { name: 'Google Workspace', patterns: ['google.com', 'googlemail.com'] },
@@ -41,7 +43,7 @@ function detectMXProvider(mxRecords) {
   const hosts = mxRecords.map(r => r.exchange.toLowerCase());
   for (const provider of MX_PROVIDERS) {
     for (const p of provider.patterns) {
-      const match = hosts.find(h => h.endsWith(p));
+      const match = hosts.find(h => h.includes(p));
       if (match) {
         return { name: provider.name, confidence: 'high', matchedBy: match };
       }
@@ -54,20 +56,44 @@ function detectMXProvider(mxRecords) {
    SPF HELPERS
 ───────────────────────────────────────────── */
 function extractSPF(txt) {
-  const records = txt.map(r => r.join('')).filter(r => r.startsWith('v=spf1'));
+  const records = txt.map(r => Array.isArray(r) ? r.join('') : r).filter(r => r.startsWith('v=spf1'));
   if (!records.length) return null;
   return { record: records[0], multiple: records.length > 1 };
 }
 
 function countSPFLookups(spf) {
-  return (spf.match(/\b(include:|a\b|mx\b|ptr\b|exists:)/g) || []).length;
+  let count = 0;
+  count += (spf.match(/include:/g) || []).length;
+  count += (spf.match(/\ba:/g) || []).length;
+  count += (spf.match(/\bmx\b/g) || []).length;
+  count += (spf.match(/\bptr\b/g) || []).length;
+  count += (spf.match(/exists:/g) || []).length;
+  return count;
 }
 
 function spfPolicy(spf) {
-  if (spf.includes('-all')) return 'fail';
-  if (spf.includes('~all')) return 'softfail';
-  if (spf.includes('?all')) return 'neutral';
-  return 'pass';
+  if (spf.includes('-all')) return 'Fail (Reject)';
+  if (spf.includes('~all')) return 'SoftFail (Accept but mark)';
+  if (spf.includes('?all')) return 'Neutral (No policy)';
+  if (spf.includes('+all')) return 'Pass (Accept all - DANGEROUS)';
+  return 'Unknown';
+}
+
+function spfMechanisms(spf) {
+  const mechanisms = [];
+  const includes = spf.match(/include:[^\s]+/g) || [];
+  includes.forEach(inc => mechanisms.push({ type: 'include', value: inc.replace('include:', '') }));
+  
+  const ip4 = spf.match(/ip4:[^\s]+/g) || [];
+  ip4.forEach(ip => mechanisms.push({ type: 'ip4', value: ip.replace('ip4:', '') }));
+  
+  const ip6 = spf.match(/ip6:[^\s]+/g) || [];
+  ip6.forEach(ip => mechanisms.push({ type: 'ip6', value: ip.replace('ip6:', '') }));
+  
+  if (/\ba\b/.test(spf)) mechanisms.push({ type: 'a', value: 'Current domain A record' });
+  if (/\bmx\b/.test(spf)) mechanisms.push({ type: 'mx', value: 'Current domain MX records' });
+  
+  return mechanisms;
 }
 
 /* ─────────────────────────────────────────────
@@ -87,6 +113,23 @@ function dkimKeySize(rec) {
 }
 
 /* ─────────────────────────────────────────────
+   DMARC PARSER
+───────────────────────────────────────────── */
+function parseDMARC(record) {
+  return {
+    policy: record.match(/p=([^;]+)/)?.[1] || 'none',
+    subdomainPolicy: record.match(/sp=([^;]+)/)?.[1] || null,
+    percentage: record.match(/pct=([^;]+)/)?.[1] || '100',
+    rua: record.match(/rua=([^;]+)/)?.[1] || null,
+    ruf: record.match(/ruf=([^;]+)/)?.[1] || null,
+    dkimAlignment: record.match(/adkim=([^;]+)/)?.[1] || 'r',
+    spfAlignment: record.match(/aspf=([^;]+)/)?.[1] || 'r',
+    reportFormat: record.match(/rf=([^;]+)/)?.[1] || 'afrf',
+    reportInterval: record.match(/ri=([^;]+)/)?.[1] || '86400'
+  };
+}
+
+/* ─────────────────────────────────────────────
    CHECKS
 ───────────────────────────────────────────── */
 async function checkMX(domain) {
@@ -94,9 +137,23 @@ async function checkMX(domain) {
     const records = await dns.resolveMx(domain);
     records.sort((a, b) => a.priority - b.priority);
     const provider = detectMXProvider(records);
-    return { status: 'PASS', records, provider, issues: [] };
+    const issues = [];
+    
+    if (records.length === 0) issues.push('No MX records found');
+    
+    return { 
+      status: issues.length > 0 ? 'WARN' : 'PASS', 
+      records, 
+      provider, 
+      issues 
+    };
   } catch (e) {
-    return { status: 'FAIL', records: [], provider: null, issues: [e.message] };
+    return { 
+      status: 'FAIL', 
+      records: [], 
+      provider: null, 
+      issues: [e.message] 
+    };
   }
 }
 
@@ -104,36 +161,56 @@ async function checkSPF(domain) {
   try {
     const txt = await dns.resolveTxt(domain);
     const spf = extractSPF(txt);
-    if (!spf) return { status: 'FAIL', issues: ['No SPF record found'] };
+    if (!spf) {
+      return { 
+        status: 'FAIL', 
+        record: null,
+        policy: null,
+        lookupCount: 0,
+        mechanisms: [],
+        issues: ['No SPF record found'] 
+      };
+    }
 
     const lookups = countSPFLookups(spf.record);
     const policy = spfPolicy(spf.record);
+    const mechanisms = spfMechanisms(spf.record);
     const issues = [];
 
     if (spf.multiple) issues.push('Multiple SPF records detected');
-    if (lookups > 10) issues.push('SPF lookup limit exceeded');
-    if (policy !== 'fail' && policy !== 'softfail') issues.push('SPF policy is too permissive');
+    if (lookups > 10) issues.push(`SPF lookup count (${lookups}) exceeds limit of 10`);
+    if (policy.includes('Neutral') || policy.includes('DANGEROUS')) {
+      issues.push('SPF policy is too permissive');
+    }
 
     return {
       status: issues.length ? 'WARN' : 'PASS',
       record: spf.record,
       policy,
       lookupCount: lookups,
+      mechanisms,
       issues
     };
   } catch (e) {
-    return { status: 'FAIL', issues: [e.message] };
+    return { 
+      status: 'FAIL', 
+      record: null,
+      policy: null,
+      lookupCount: 0,
+      mechanisms: [],
+      issues: [e.message] 
+    };
   }
 }
 
 async function checkDKIM(domain) {
-  const selectors = ['google', 'selector1', 'selector2', 'default', 's1', 's2'];
+  const selectors = ['google', 'selector1', 'selector2', 'default', 's1', 's2', 'dkim', 'k1'];
   const found = [];
 
   for (const s of selectors) {
     try {
       const recs = await dns.resolveTxt(`${s}._domainkey.${domain}`);
-      const record = recs[0].join('');
+      const record = recs[0] ? (Array.isArray(recs[0]) ? recs[0].join('') : recs[0]) : '';
       if (record.includes('p=')) {
         found.push({
           selector: s,
@@ -148,55 +225,145 @@ async function checkDKIM(domain) {
 
   return found.length
     ? { status: 'PASS', selectors: found, issues: [] }
-    : { status: 'WARN', selectors: [], issues: ['No DKIM found on common selectors'] };
+    : { 
+        status: 'WARN', 
+        selectors: [], 
+        issues: ['No DKIM found on common selectors'] 
+      };
 }
 
 async function checkDMARC(domain) {
   try {
     const recs = await dns.resolveTxt(`_dmarc.${domain}`);
-    const record = recs[0].join('');
-    const policy = record.match(/p=([^;]+)/)?.[1] || 'none';
-    const rua = record.match(/rua=([^;]+)/)?.[1];
-    const pct = record.match(/pct=([^;]+)/)?.[1] || '100';
+    const record = recs[0] ? (Array.isArray(recs[0]) ? recs[0].join('') : recs[0]) : '';
+    const parsed = parseDMARC(record);
     const issues = [];
 
-    if (policy === 'none') issues.push('DMARC policy is none');
-    if (!rua) issues.push('No DMARC rua configured');
+    if (parsed.policy === 'none') {
+      issues.push('DMARC policy is "none" - monitoring only');
+    }
+    if (!parsed.rua) {
+      issues.push('No aggregate report address configured');
+    }
 
-    return { status: issues.length ? 'WARN' : 'PASS', record, policy, rua, pct, issues };
+    return { 
+      status: issues.length ? 'WARN' : 'PASS', 
+      record, 
+      parsed,
+      issues 
+    };
   } catch {
-    return { status: 'FAIL', issues: ['No DMARC record found'] };
+    return { 
+      status: 'FAIL', 
+      record: null,
+      parsed: null,
+      issues: ['No DMARC record found'] 
+    };
   }
 }
 
 async function checkPTR(ip) {
-  if (!ip) return { status: 'SKIPPED', issues: ['No IP provided'] };
+  if (!ip) {
+    return { 
+      status: 'SKIPPED', 
+      hostname: null,
+      fcRdns: null,
+      issues: ['No IP address provided'] 
+    };
+  }
+  
   try {
-    const host = (await dns.reverse(ip))[0];
-    const addrs = await dns.resolve(host);
-    return { status: addrs.includes(ip) ? 'PASS' : 'FAIL', hostname: host, fcRdns: addrs.includes(ip), issues: [] };
+    const hostnames = await dns.reverse(ip);
+    const hostname = hostnames[0];
+    
+    try {
+      const addrs = await dns.resolve4(hostname);
+      const fcRdns = addrs.includes(ip);
+      
+      return { 
+        status: fcRdns ? 'PASS' : 'FAIL', 
+        hostname, 
+        fcRdns, 
+        issues: fcRdns ? [] : ['FC-rDNS failed'] 
+      };
+    } catch {
+      return {
+        status: 'FAIL',
+        hostname,
+        fcRdns: false,
+        issues: ['Forward DNS lookup failed']
+      };
+    }
   } catch (e) {
-    return { status: 'FAIL', issues: [e.message] };
+    return { 
+      status: 'FAIL', 
+      hostname: null,
+      fcRdns: null,
+      issues: [`PTR lookup failed: ${e.message}`] 
+    };
   }
 }
 
-/* ─────────────────────────────────────────────
-   REPUTATION (HEURISTIC, SAFE)
-───────────────────────────────────────────── */
+async function checkAllTXT(domain) {
+  try {
+    const records = await dns.resolveTxt(domain);
+    const formatted = records.map(r => Array.isArray(r) ? r.join('') : r);
+    
+    const categorized = {
+      spf: formatted.filter(r => r.startsWith('v=spf1')),
+      verification: formatted.filter(r => 
+        r.includes('verification') || 
+        r.startsWith('google-site-verification=') ||
+        r.startsWith('MS=')
+      ),
+      other: formatted.filter(r => 
+        !r.startsWith('v=spf1') && 
+        !r.includes('verification') &&
+        !r.startsWith('google-site-verification=') &&
+        !r.startsWith('MS=')
+      )
+    };
+    
+    return {
+      status: 'PASS',
+      all: formatted,
+      categorized,
+      total: formatted.length
+    };
+  } catch (e) {
+    return {
+      status: 'FAIL',
+      all: [],
+      categorized: { spf: [], verification: [], other: [] },
+      total: 0,
+      error: e.message
+    };
+  }
+}
+
 function buildReputation({ spf, dkim, dmarc }) {
   let score = 100;
   const notes = [];
 
-  if (spf?.policy !== 'fail' && spf?.policy !== 'softfail') {
-    score -= 20; notes.push('SPF policy is weak');
+  if (!spf?.record) {
+    score -= 25;
+    notes.push('No SPF record configured');
+  } else if (spf.policy?.includes('Neutral') || spf.policy?.includes('DANGEROUS')) {
+    score -= 20;
+    notes.push('SPF policy is weak');
   }
+
   if (!dkim?.selectors?.length) {
-    score -= 30; notes.push('No DKIM detected');
-  } else if (dkim.selectors.some(s => s.keySize === '1024-bit')) {
-    score -= 10; notes.push('Weak DKIM key size');
+    score -= 30;
+    notes.push('No DKIM detected');
   }
-  if (dmarc?.policy === 'none') {
-    score -= 20; notes.push('DMARC policy is none');
+
+  if (!dmarc?.record) {
+    score -= 25;
+    notes.push('No DMARC configured');
+  } else if (dmarc.parsed?.policy === 'none') {
+    score -= 15;
+    notes.push('DMARC policy is none');
   }
 
   let level = 'Good';
@@ -206,27 +373,39 @@ function buildReputation({ spf, dkim, dmarc }) {
   return { score, level, notes };
 }
 
-/* ─────────────────────────────────────────────
-   API
-───────────────────────────────────────────── */
 app.post('/api/check', async (req, res) => {
   const { domain, ip } = req.body;
   const clean = domain?.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '');
   if (!clean) return res.status(400).json({ error: 'Domain required' });
 
-  const [mx, spf, dkim, dmarc, ptr] = await Promise.all([
+  const [mx, spf, dkim, dmarc, ptr, txt] = await Promise.all([
     checkMX(clean),
     checkSPF(clean),
     checkDKIM(clean),
     checkDMARC(clean),
-    checkPTR(ip)
+    checkPTR(ip),
+    checkAllTXT(clean)
   ]);
 
   const reputation = buildReputation({ spf, dkim, dmarc });
 
-  res.json({ domain: clean, mx, spf, dkim, dmarc, ptr, reputation });
+  res.json({ 
+    domain: clean, 
+    timestamp: new Date().toISOString(),
+    mx, 
+    spf, 
+    dkim, 
+    dmarc, 
+    ptr, 
+    txt,
+    reputation 
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK' });
 });
 
 app.listen(process.env.PORT || 3001, () =>
-  console.log('🚀 Email DNS Inspector API running')
+  console.log('🚀 DNS Inspector API running')
 );
