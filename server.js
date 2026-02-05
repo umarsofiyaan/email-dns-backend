@@ -7,8 +7,8 @@ const app = express();
    CORS (Cloudflare Pages → Render)
 ───────────────────────────────────────────── */
 const allowedOrigins = [
-  'https://umarsofiyaan.shop',
-  'https://email-dns-frontend.pages.dev'
+  'https://email-dns-frontend.pages.dev',
+  'https://dns.umarsofiyaan.shop'
 ];
 
 app.use((req, res, next) => {
