@@ -1,13 +1,24 @@
 {
-  "name": "email-dns-inspector-backend",
+  "name": "email-dns-inspector",
   "version": "1.0.0",
-  "description": "Email DNS Inspector - Backend API for DNS record analysis",
+  "description": "Professional Email DNS Inspector - Comprehensive email authentication and DNS security analysis tool",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
-  "keywords": ["dns", "email", "spf", "dkim", "dmarc", "mx"],
+  "keywords": [
+    "dns",
+    "email",
+    "spf",
+    "dkim",
+    "dmarc",
+    "mx",
+    "ptr",
+    "email-security",
+    "dns-inspector",
+    "email-authentication"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
@@ -15,5 +26,8 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
 }
