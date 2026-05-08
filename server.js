@@ -9,6 +9,7 @@ const app = express();
 const allowedOrigins = [
   'https://email-dns-frontend.pages.dev',
   'https://dns.umarsofiyaan.shop',
+   'https://gervacio-dns.umarsofiyaan.shop',
   'http://localhost:3000',
   'http://127.0.0.1:3000'
 ];
