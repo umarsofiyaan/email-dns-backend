@@ -1,5 +1,7 @@
 const express = require('express');
 const dns = require('dns').promises;
+const https = require('https');
+const dgram = require('dgram');
 
 const app = express();
 
@@ -51,6 +53,218 @@ function detectMXProvider(mxRecords) {
     }
   }
   return { name: 'Custom / Self-hosted', confidence: 'low', matchedBy: null };
+}
+
+
+/* ─────────────────────────────────────────────
+   DNS PROVIDER MAP
+───────────────────────────────────────────── */
+const DNS_PROVIDERS = [
+  { name: 'Cloudflare', patterns: ['cloudflare.com', 'cloudflare.net'], score: 95 },
+  { name: 'Amazon Route 53', patterns: ['awsdns-'], score: 94 },
+  { name: 'Google Cloud DNS', patterns: ['googledomains.com', 'google.com'], score: 92 },
+  { name: 'Microsoft Azure DNS', patterns: ['azure-dns.com', 'azure-dns.net', 'azure-dns.org', 'azure-dns.info'], score: 91 },
+  { name: 'Akamai', patterns: ['akam.net', 'akamai.com', 'akadns.net'], score: 92 },
+  { name: 'NS1', patterns: ['nsone.net', 'ns1.com'], score: 91 },
+  { name: 'DNS Made Easy', patterns: ['dnsmadeeasy.com'], score: 90 },
+  { name: 'DigitalOcean', patterns: ['digitalocean.com'], score: 86 },
+  { name: 'Hetzner', patterns: ['hetzner.com', 'your-server.de'], score: 84 },
+  { name: 'Namecheap', patterns: ['registrar-servers.com'], score: 82 },
+  { name: 'GoDaddy', patterns: ['domaincontrol.com'], score: 80 },
+  { name: 'Porkbun', patterns: ['porkbun.com'], score: 82 },
+  { name: 'Hostinger', patterns: ['dns-parking.com', 'hostinger.com'], score: 78 },
+  { name: 'Bluehost', patterns: ['bluehost.com'], score: 76 },
+  { name: 'Squarespace Domains', patterns: ['squarespacedns.com'], score: 82 }
+];
+
+function normalizeHost(host) {
+  return String(host || '').trim().toLowerCase().replace(/\.$/, '');
+}
+
+function encodeDnsName(domain) {
+  return Buffer.concat(domain.split('.').map(label => {
+    const value = Buffer.from(label, 'ascii');
+    return Buffer.concat([Buffer.from([value.length]), value]);
+  }).concat(Buffer.from([0])));
+}
+
+function readDnsName(buffer, offset, depth = 0) {
+  if (depth > 10) throw new Error('DNS compression pointer loop detected');
+
+  const labels = [];
+  let current = offset;
+  let consumed = 0;
+
+  while (current < buffer.length) {
+    const length = buffer[current];
+
+    if ((length & 0xc0) === 0xc0) {
+      const pointer = ((length & 0x3f) << 8) | buffer[current + 1];
+      const pointed = readDnsName(buffer, pointer, depth + 1);
+      labels.push(pointed.name);
+      consumed += 2;
+      return { name: labels.filter(Boolean).join('.'), offset: offset + consumed };
+    }
+
+    if (length === 0) {
+      consumed += 1;
+      return { name: labels.join('.'), offset: offset + consumed };
+    }
+
+    current += 1;
+    labels.push(buffer.slice(current, current + length).toString('ascii'));
+    current += length;
+    consumed += length + 1;
+  }
+
+  throw new Error('Invalid DNS name in response');
+}
+
+function queryDnsNsOverUdp(domain, server) {
+  return new Promise((resolve, reject) => {
+    const family = server.includes(':') ? 'udp6' : 'udp4';
+    const socket = dgram.createSocket(family);
+    const id = Math.floor(Math.random() * 65535);
+    const question = encodeDnsName(domain);
+    const packet = Buffer.concat([
+      Buffer.from([
+        (id >> 8) & 0xff, id & 0xff,
+        0x01, 0x00,
+        0x00, 0x01,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x00
+      ]),
+      question,
+      Buffer.from([0x00, 0x02, 0x00, 0x01])
+    ]);
+
+    let settled = false;
+    const done = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.close();
+      error ? reject(error) : resolve(result);
+    };
+
+    const timer = setTimeout(() => done(new Error(`DNS UDP query timed out for ${server}`)), 4000);
+
+    socket.on('message', (message) => {
+      try {
+        const responseId = message.readUInt16BE(0);
+        if (responseId !== id) return;
+
+        const answerCount = message.readUInt16BE(6);
+        const authorityCount = message.readUInt16BE(8);
+        let offset = 12;
+
+        for (let i = 0; i < message.readUInt16BE(4); i += 1) {
+          offset = readDnsName(message, offset).offset + 4;
+        }
+
+        const records = [];
+        for (let i = 0; i < answerCount + authorityCount; i += 1) {
+          offset = readDnsName(message, offset).offset;
+          const type = message.readUInt16BE(offset);
+          offset += 2;
+          offset += 2; // class
+          offset += 4; // ttl
+          const rdLength = message.readUInt16BE(offset);
+          offset += 2;
+          const rdStart = offset;
+
+          if (type === 2) {
+            records.push(readDnsName(message, offset).name);
+          }
+
+          offset = rdStart + rdLength;
+        }
+
+        done(null, records);
+      } catch (e) {
+        done(e);
+      }
+    });
+
+    socket.on('error', done);
+    socket.send(packet, 53, server);
+  });
+}
+
+async function resolveNameServers(domain) {
+  try {
+    return await dns.resolveNs(domain);
+  } catch (e) {
+    if (e.code && !['ENOTIMP', 'ENODATA', 'ENOTFOUND', 'ESERVFAIL', 'ETIMEOUT'].includes(e.code)) {
+      throw e;
+    }
+
+    const servers = [...new Set([...dns.getServers(), '1.1.1.1', '8.8.8.8'])]
+      .map(server => server.replace(/^\[|\]$/g, '').replace(/#\d+$/, ''));
+
+    try {
+      return await Promise.any(servers.map(async (server) => {
+        const records = await queryDnsNsOverUdp(domain, server);
+        if (!records.length) throw new Error(`No NS records returned from ${server}`);
+        return records;
+      }));
+    } catch (fallbackError) {
+      const reason = fallbackError.errors?.[0]?.message || fallbackError.message || e.message;
+      throw new Error(reason || 'No NS records found');
+    }
+  }
+}
+
+function detectDNSProvider(host) {
+  const normalized = normalizeHost(host);
+  for (const provider of DNS_PROVIDERS) {
+    const matchedBy = provider.patterns.find(pattern => normalized.includes(pattern));
+    if (matchedBy) {
+      return {
+        name: provider.name,
+        score: provider.score,
+        confidence: 'high',
+        matchedBy
+      };
+    }
+  }
+  return {
+    name: 'Custom / Unknown DNS',
+    score: 60,
+    confidence: 'low',
+    matchedBy: normalized || null
+  };
+}
+
+function selectPrimaryDNSProvider(records) {
+  if (!records.length) {
+    return {
+      name: 'Unknown',
+      score: 'N/A',
+      confidence: 'low',
+      matchedBy: null
+    };
+  }
+
+  const counts = new Map();
+  for (const record of records) {
+    const current = counts.get(record.provider.name) || { ...record.provider, count: 0 };
+    current.count += 1;
+    counts.set(record.provider.name, current);
+  }
+
+  const [primary] = [...counts.values()].sort((a, b) => {
+    if (b.count !== a.count) return b.count - a.count;
+    return Number(b.score || 0) - Number(a.score || 0);
+  });
+
+  return {
+    name: primary.name,
+    score: primary.score,
+    confidence: primary.confidence,
+    matchedBy: primary.matchedBy
+  };
 }
 
 /* ─────────────────────────────────────────────
@@ -130,9 +344,155 @@ function parseDMARC(record) {
   };
 }
 
+
+/* ─────────────────────────────────────────────
+   RDAP HELPERS
+───────────────────────────────────────────── */
+function requestJson(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, {
+      headers: {
+        'Accept': 'application/rdap+json, application/json',
+        'User-Agent': 'email-dns-inspector/1.0'
+      },
+      timeout: 8000
+    }, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        return resolve(requestJson(new URL(res.headers.location, url).toString()));
+      }
+
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => { body += chunk; });
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          return reject(new Error(`RDAP request failed with HTTP ${res.statusCode}`));
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (e) {
+          reject(new Error(`RDAP response was not valid JSON: ${e.message}`));
+        }
+      });
+    });
+
+    req.on('timeout', () => req.destroy(new Error('RDAP request timed out')));
+    req.on('error', reject);
+  });
+}
+
+function vcardValue(entity, key) {
+  const entries = entity?.vcardArray?.[1] || [];
+  const item = entries.find(([name]) => name === key);
+  return item?.[3] || null;
+}
+
+function findRegistrarEntity(entities = []) {
+  return entities.find(entity => (entity.roles || []).includes('registrar')) || null;
+}
+
+function publicIdValue(entity, typePattern) {
+  const item = (entity?.publicIds || []).find(id => typePattern.test(id.type || ''));
+  return item?.identifier || null;
+}
+
+function linkHref(links = [], rels = ['about', 'self']) {
+  const link = links.find(l => rels.includes(l.rel) && l.href);
+  return link?.href || null;
+}
+
+function eventDate(events = [], actions = []) {
+  const event = events.find(e => actions.includes(e.eventAction));
+  return event?.eventDate || null;
+}
+
+function parseRegistrarFromRDAP(data) {
+  const registrar = findRegistrarEntity(data.entities || []);
+  const name = vcardValue(registrar, 'fn') || data.registrarName || null;
+  const ianaId = publicIdValue(registrar, /IANA Registrar ID/i) || data.registrarIANAID || null;
+
+  return {
+    status: name ? 'PASS' : 'WARN',
+    name,
+    registrar: name,
+    ianaId,
+    registrarId: ianaId,
+    whoisServer: data.port43 || null,
+    url: vcardValue(registrar, 'url') || linkHref(registrar?.links || []) || null,
+    createdAt: eventDate(data.events || [], ['registration']),
+    updatedAt: eventDate(data.events || [], ['last changed', 'last update of RDAP database']),
+    expiresAt: eventDate(data.events || [], ['expiration']),
+    domainStatus: data.status || [],
+    source: 'RDAP',
+    issues: name ? [] : ['RDAP response did not include registrar details']
+  };
+}
+
 /* ─────────────────────────────────────────────
    CHECKS
 ───────────────────────────────────────────── */
+
+async function checkNameServers(domain) {
+  try {
+    const records = (await resolveNameServers(domain))
+      .map(host => normalizeHost(host))
+      .sort()
+      .map(host => ({
+        host,
+        provider: detectDNSProvider(host)
+      }));
+
+    const issues = [];
+    if (records.length === 0) issues.push('No NS records found');
+
+    const provider = selectPrimaryDNSProvider(records);
+    const uniqueProviders = new Set(records.map(record => record.provider.name));
+    if (uniqueProviders.size > 1) {
+      issues.push(`Multiple DNS providers detected: ${[...uniqueProviders].join(', ')}`);
+    }
+
+    return {
+      status: issues.length ? 'WARN' : 'PASS',
+      checkedAt: new Date().toISOString(),
+      provider,
+      records,
+      issues
+    };
+  } catch (e) {
+    return {
+      status: 'FAIL',
+      checkedAt: new Date().toISOString(),
+      provider: selectPrimaryDNSProvider([]),
+      records: [],
+      issues: [`NS lookup failed: ${e.message}`]
+    };
+  }
+}
+
+async function checkRegistrar(domain) {
+  try {
+    const data = await requestJson(`https://rdap.org/domain/${encodeURIComponent(domain)}`);
+    return parseRegistrarFromRDAP(data);
+  } catch (e) {
+    return {
+      status: 'WARN',
+      name: null,
+      registrar: null,
+      ianaId: null,
+      registrarId: null,
+      whoisServer: null,
+      url: null,
+      createdAt: null,
+      updatedAt: null,
+      expiresAt: null,
+      domainStatus: [],
+      source: 'RDAP',
+      issues: [`Registrar lookup unavailable: ${e.message || String(e) || 'Unknown RDAP error'}`]
+    };
+  }
+}
+
 async function checkMX(domain) {
   try {
     const records = await dns.resolveMx(domain);
@@ -379,8 +739,10 @@ app.post('/api/check', async (req, res) => {
   const clean = domain?.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '');
   if (!clean) return res.status(400).json({ error: 'Domain required' });
 
-  const [mx, spf, dkim, dmarc, ptr, txt] = await Promise.all([
+  const [mx, nameServers, registrar, spf, dkim, dmarc, ptr, txt] = await Promise.all([
     checkMX(clean),
+    checkNameServers(clean),
+    checkRegistrar(clean),
     checkSPF(clean),
     checkDKIM(clean),
     checkDMARC(clean),
@@ -393,7 +755,9 @@ app.post('/api/check', async (req, res) => {
   res.json({ 
     domain: clean, 
     timestamp: new Date().toISOString(),
-    mx, 
+    mx,
+    nameServers,
+    registrar,
     spf, 
     dkim, 
     dmarc, 
