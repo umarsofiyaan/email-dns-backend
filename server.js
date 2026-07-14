@@ -2,6 +2,7 @@ const express = require('express');
 const dns = require('dns').promises;
 const https = require('https');
 const dgram = require('dgram');
+const net = require('net');
 
 const app = express();
 
@@ -27,7 +28,54 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '16kb' }));
+
+/* ─────────────────────────────────────────────
+   INPUT VALIDATION
+───────────────────────────────────────────── */
+const DOMAIN_LABEL_REGEX = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+function normalizeDomain(input) {
+  const raw = String(input || '').trim().toLowerCase();
+  if (!raw) return '';
+
+  let host = raw;
+  try {
+    host = new URL(raw.includes('://') ? raw : `http://${raw}`).hostname;
+  } catch {
+    host = raw.split('/')[0].split('?')[0].split('#')[0];
+  }
+
+  return host.replace(/\.$/, '');
+}
+
+function isValidDomain(domain) {
+  if (!domain || domain.length > 253 || domain.includes('..') || domain.includes('_')) return false;
+  if (net.isIP(domain)) return false;
+
+  const labels = domain.split('.');
+  if (labels.length < 2) return false;
+
+  return labels.every(label => DOMAIN_LABEL_REGEX.test(label));
+}
+
+function normalizeIp(input) {
+  const value = String(input || '').trim();
+  return value || null;
+}
+
+function isValidOptionalIp(ip) {
+  return !ip || net.isIP(ip) !== 0;
+}
+
+function asyncTimeout(promise, milliseconds, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${milliseconds}ms`)), milliseconds);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 /* ─────────────────────────────────────────────
    MX PROVIDER MAP
@@ -566,23 +614,25 @@ async function checkSPF(domain) {
 
 async function checkDKIM(domain) {
   const selectors = ['google', 'selector1', 'selector2', 'default', 's1', 's2', 'dkim', 'k1'];
-  const found = [];
 
-  for (const s of selectors) {
+  const checks = await Promise.all(selectors.map(async (s) => {
     try {
-      const recs = await dns.resolveTxt(`${s}._domainkey.${domain}`);
+      const recs = await asyncTimeout(dns.resolveTxt(`${s}._domainkey.${domain}`), 3000, `DKIM lookup for ${s}`);
       const record = recs[0] ? (Array.isArray(recs[0]) ? recs[0].join('') : recs[0]) : '';
       if (record.includes('p=')) {
-        found.push({
+        return {
           selector: s,
           host: `${s}._domainkey.${domain}`,
           record,
           keyType: dkimKeyType(record),
           keySize: dkimKeySize(record)
-        });
+        };
       }
     } catch {}
-  }
+    return null;
+  }));
+
+  const found = checks.filter(Boolean);
 
   return found.length
     ? { status: 'PASS', selectors: found, issues: [] }
@@ -735,9 +785,13 @@ function buildReputation({ spf, dkim, dmarc }) {
 }
 
 app.post('/api/check', async (req, res) => {
-  const { domain, ip } = req.body;
-  const clean = domain?.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/$/, '');
+  const { domain, ip } = req.body || {};
+  const clean = normalizeDomain(domain);
+  const cleanIp = normalizeIp(ip);
+
   if (!clean) return res.status(400).json({ error: 'Domain required' });
+  if (!isValidDomain(clean)) return res.status(400).json({ error: 'Invalid domain' });
+  if (!isValidOptionalIp(cleanIp)) return res.status(400).json({ error: 'Invalid IP address' });
 
   const [mx, nameServers, registrar, spf, dkim, dmarc, ptr, txt] = await Promise.all([
     checkMX(clean),
@@ -746,7 +800,7 @@ app.post('/api/check', async (req, res) => {
     checkSPF(clean),
     checkDKIM(clean),
     checkDMARC(clean),
-    checkPTR(ip),
+    checkPTR(cleanIp),
     checkAllTXT(clean)
   ]);
 
@@ -771,6 +825,17 @@ app.get('/health', (req, res) => {
   res.json({ status: 'OK' });
 });
 
-app.listen(process.env.PORT || 3001, () =>
-  console.log('🚀 DNS Inspector API running')
-);
+if (require.main === module) {
+  app.listen(process.env.PORT || 3001, () =>
+    console.log('🚀 DNS Inspector API running')
+  );
+}
+
+module.exports = {
+  app,
+  normalizeDomain,
+  isValidDomain,
+  normalizeIp,
+  isValidOptionalIp,
+  buildReputation
+};
