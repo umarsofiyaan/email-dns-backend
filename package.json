@@ -4,6 +4,7 @@
   "description": "Professional Email DNS Inspector - Comprehensive email authentication and DNS security analysis tool",
   "main": "server.js",
   "scripts": {
+    "test": "node --test",
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
